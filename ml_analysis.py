@@ -14,7 +14,7 @@ import argparse
 # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 # STEP 1: DATA INGESTION AND FEATURE ENGINEERING
 # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-def step_ 1_ da ta_ ingestion ( xml_file_path ) :
+def step_ 1_ data_ ingestion ( xml_file_path ) :
 " " " Parses XML , extracts features , structures data , and encodes it . " " "
 print ( " \n - - - Step 1: Data Ingestion and Feature Engineering ---" )
 try :
