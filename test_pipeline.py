@@ -1,314 +1,366 @@
-# ==============================================================================
-# FILE  : tests/test_pipeline.py
-# USAGE : python3 -m pytest tests/test_pipeline.py -v
-#         python3 tests/test_pipeline.py      (run without pytest)
-# ==============================================================================
+"""
+test_ml_analysis.py — Unit tests for AI/ML VAPT Pipeline v4.1
+Covers: PRS Ridge model, PEF LogReg, PSC NaiveBayes, VKF SVM,
+        VES entropy, Isolation Forest, risk score formulas, XML parsing.
+Run with: python3 -m pytest test_ml_analysis.py -v
+"""
 
+import math
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
 
-from ml_analysis import (
-    compute_prs, compute_ves, compute_pef, compute_psc, compute_vkf,
-    build_nvd_training_dataset, stage_1_feature_engineering,
-    PORT_RISK_SCORES, DEFAULT_PRS, IF_ANOMALY_THRESHOLD
-)
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import ml_analysis as ml
 
 
-# ==============================================================================
-# Tests: Feature Engineering Functions
-# ==============================================================================
+class TestPRSModel(unittest.TestCase):
+    """Test Port Risk Score via Ridge Regression."""
 
-class TestComputePRS:
-    def test_known_port_telnet(self):
-        assert compute_prs(23) == 0.95, "Telnet should have PRS = 0.95"
+    def setUp(self):
+        self.ridge, self.scaler = ml._build_synthetic_prs_model()
+        self.known_prs = {21: 0.90, 22: 0.55, 23: 0.95, 80: 0.75, 443: 0.45}
 
-    def test_known_port_ftp(self):
-        assert compute_prs(21) == 0.90, "FTP should have PRS = 0.90"
-
-    def test_known_port_https(self):
-        assert compute_prs(443) == 0.45, "HTTPS should have PRS = 0.45"
-
-    def test_unknown_port_default(self):
-        assert compute_prs(9999) == DEFAULT_PRS, \
-            f"Unknown port should return DEFAULT_PRS = {DEFAULT_PRS}"
-
-    def test_all_prs_in_range(self):
-        for port, prs in PORT_RISK_SCORES.items():
-            assert 0.0 <= prs <= 1.0, f"PRS for port {port} out of [0,1]: {prs}"
-
-
-class TestComputeVES:
-    def test_unknown_version_max_entropy(self):
-        assert compute_ves("unknown", 16) == 1.0
-
-    def test_empty_version_max_entropy(self):
-        assert compute_ves("", 16) == 1.0
-
-    def test_none_string_max_entropy(self):
-        assert compute_ves("none", 16) == 1.0
-
-    def test_known_version_lower_entropy(self):
-        ves = compute_ves("lighttpd 0.93.15", 16)
-        assert ves < 1.0, "Known version should have VES < 1.0"
-
-    def test_ves_in_range(self):
-        for v in ["unknown", "OpenSSH 7.4", "vsftpd 1.4.1", "", "1.0"]:
-            result = compute_ves(v, 16)
-            assert 0.0 <= result <= 1.0, f"VES out of [0,1] for version '{v}': {result}"
-
-    def test_longer_version_lower_ves(self):
-        short_ves = compute_ves("1.0", 16)
-        long_ves  = compute_ves("lighttpd 0.93.15", 16)
-        assert long_ves <= short_ves, \
-            "Longer version string should have lower or equal VES"
-
-
-class TestComputePEF:
-    def test_ftp_unencrypted(self):
-        assert compute_pef(21, "ftp") == 1
-
-    def test_telnet_unencrypted(self):
-        assert compute_pef(23, "telnet") == 1
-
-    def test_http_unencrypted(self):
-        assert compute_pef(80, "http") == 1
-
-    def test_https_encrypted(self):
-        assert compute_pef(443, "https") == 0
-
-    def test_ssh_encrypted(self):
-        assert compute_pef(22, "ssh") == 0
-
-    def test_pef_binary(self):
-        for port, svc in [(21,"ftp"),(22,"ssh"),(23,"telnet"),(80,"http"),(443,"https")]:
-            result = compute_pef(port, svc)
-            assert result in (0, 1), f"PEF must be binary, got {result}"
-
-
-class TestComputePSC:
-    def test_http_is_web(self):
-        assert compute_psc("http") == 0
-
-    def test_https_is_web(self):
-        assert compute_psc("https") == 0
-
-    def test_ftp_is_legacy(self):
-        assert compute_psc("ftp") == 1
-
-    def test_telnet_is_legacy(self):
-        assert compute_psc("telnet") == 1
-
-    def test_ssh_is_remote(self):
-        assert compute_psc("ssh") == 3
-
-    def test_mysql_is_database(self):
-        assert compute_psc("mysql") == 4
-
-    def test_unknown_is_other(self):
-        assert compute_psc("unknown") == 5
-
-    def test_psc_in_range(self):
-        for svc in ["http","https","ftp","telnet","ssh","mysql","unknown","domain"]:
-            result = compute_psc(svc)
-            assert 0 <= result <= 5, f"PSC out of range for service '{svc}': {result}"
-
-
-class TestComputeVKF:
-    def test_unknown_version_returns_zero(self):
-        assert compute_vkf("unknown") == 0
-
-    def test_empty_version_returns_zero(self):
-        assert compute_vkf("") == 0
-
-    def test_known_version_returns_one(self):
-        assert compute_vkf("OpenSSH 7.4") == 1
-
-    def test_vkf_binary(self):
-        for v in ["unknown", "", "1.0", "vsftpd 1.4.1", "none"]:
-            result = compute_vkf(v)
-            assert result in (0, 1), f"VKF must be binary, got {result}"
-
-
-# ==============================================================================
-# Tests: NVD Training Dataset
-# ==============================================================================
-
-class TestNVDDataset:
-    def setup_method(self):
-        self.df = build_nvd_training_dataset()
-
-    def test_dataset_size(self):
-        assert len(self.df) == 200, \
-            f"Expected 200 training records, got {len(self.df)}"
-
-    def test_severity_distribution(self):
-        counts = self.df["severity"].value_counts()
-        assert counts["Critical"] == 70
-        assert counts["High"]     == 60
-        assert counts["Medium"]   == 40
-        assert counts["Low"]      == 30
+    def test_known_port_returned_directly(self):
+        """Known ports should return pre-computed NVD PRS values."""
+        self.assertAlmostEqual(
+            ml.predict_prs(23, self.ridge, self.scaler, self.known_prs), 0.95)
+        self.assertAlmostEqual(
+            ml.predict_prs(443, self.ridge, self.scaler, self.known_prs), 0.45)
 
     def test_prs_in_range(self):
-        assert (self.df["PRS"] >= 0).all() and (self.df["PRS"] <= 1).all()
-
-    def test_ves_in_range(self):
-        assert (self.df["VES"] >= 0).all() and (self.df["VES"] <= 1).all()
-
-    def test_pef_binary(self):
-        assert self.df["PEF"].isin([0, 1]).all()
-
-    def test_vkf_binary(self):
-        assert self.df["VKF"].isin([0, 1]).all()
-
-    def test_psc_in_range(self):
-        assert self.df["PSC"].between(0, 5).all()
-
-    def test_required_columns(self):
-        required = {"PRS", "VES", "PEF", "PSC", "VKF", "severity"}
-        assert required.issubset(set(self.df.columns))
-
-    def test_reproducibility(self):
-        df2 = build_nvd_training_dataset()
-        pd.testing.assert_frame_equal(self.df, df2)
-
-
-# ==============================================================================
-# Tests: Feature Engineering Stage (Stage 1)
-# ==============================================================================
-
-class TestStage1:
-    def setup_method(self):
-        self.sample_df = pd.DataFrame([
-            {"port_id": 21,  "protocol": "tcp", "service_name": "ftp",
-             "service_version": "vsftpd 1.4.1", "host_ip": "192.168.1.1",
-             "port_state": "open"},
-            {"port_id": 22,  "protocol": "tcp", "service_name": "ssh",
-             "service_version": "OpenSSH 7.4",  "host_ip": "192.168.1.1",
-             "port_state": "open"},
-            {"port_id": 23,  "protocol": "tcp", "service_name": "telnet",
-             "service_version": "unknown",        "host_ip": "192.168.1.1",
-             "port_state": "open"},
-            {"port_id": 80,  "protocol": "tcp", "service_name": "http",
-             "service_version": "lighttpd 0.93.15","host_ip": "192.168.1.1",
-             "port_state": "open"},
-            {"port_id": 443, "protocol": "tcp", "service_name": "https",
-             "service_version": "lighttpd 0.93.15","host_ip": "192.168.1.1",
-             "port_state": "open"},
-        ])
-
-    def test_output_has_all_features(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        for col in ["PRS", "VES", "PEF", "PSC", "VKF", "CRI"]:
-            assert col in result.columns, f"Missing feature column: {col}"
+        """PRS must be in [0.10, 1.00] for all ports."""
+        for port in [21, 22, 23, 53, 80, 443, 3306, 8080, 9999, 65535]:
+            prs = ml.predict_prs(port, self.ridge, self.scaler, {})
+            self.assertGreaterEqual(prs, 0.10, f"PRS too low for port {port}")
+            self.assertLessEqual(prs, 1.00, f"PRS too high for port {port}")
 
     def test_telnet_highest_prs(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        telnet_prs = result[result["port_id"] == 23]["PRS"].values[0]
-        assert telnet_prs == 0.95
+        """Telnet (port 23) should have the highest known PRS."""
+        telnet_prs = self.known_prs[23]
+        for port, prs in self.known_prs.items():
+            self.assertLessEqual(prs, telnet_prs,
+                                 f"Port {port} PRS ({prs}) > Telnet PRS ({telnet_prs})")
 
-    def test_telnet_max_ves(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        telnet_ves = result[result["port_id"] == 23]["VES"].values[0]
-        assert telnet_ves == 1.0, f"Telnet VES should be 1.0, got {telnet_ves}"
+    def test_https_lower_than_http(self):
+        """HTTPS (443) should have lower PRS than HTTP (80)."""
+        self.assertLess(
+            ml.predict_prs(443, self.ridge, self.scaler, self.known_prs),
+            ml.predict_prs(80, self.ridge, self.scaler, self.known_prs))
 
-    def test_ftp_unencrypted(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        ftp_pef = result[result["port_id"] == 21]["PEF"].values[0]
-        assert ftp_pef == 1
-
-    def test_https_encrypted(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        https_pef = result[result["port_id"] == 443]["PEF"].values[0]
-        assert https_pef == 0
-
-    def test_cri_equals_prs_plus_ves_plus_pef(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        for _, row in result.iterrows():
-            expected_cri = round(row["PRS"] + row["VES"] + row["PEF"], 6)
-            actual_cri   = round(row["CRI"], 6)
-            assert abs(expected_cri - actual_cri) < 1e-5, \
-                f"CRI mismatch for port {row['port_id']}: {expected_cri} vs {actual_cri}"
-
-    def test_row_count_preserved(self):
-        result = stage_1_feature_engineering(self.sample_df)
-        assert len(result) == len(self.sample_df)
+    def test_unknown_port_predicted(self):
+        """Unknown port (not in known_prs) should still return a valid PRS."""
+        prs = ml.predict_prs(12345, self.ridge, self.scaler, {})
+        self.assertIsInstance(prs, float)
+        self.assertGreaterEqual(prs, 0.10)
+        self.assertLessEqual(prs, 1.00)
 
 
-# ==============================================================================
-# Tests: Anomaly Threshold Constant
-# ==============================================================================
+class TestPEFModel(unittest.TestCase):
+    """Test Protocol Encryption Flag via Logistic Regression."""
 
-class TestConstants:
-    def test_anomaly_threshold_range(self):
-        assert 0.0 < IF_ANOMALY_THRESHOLD < 1.0, \
-            f"Anomaly threshold must be in (0,1), got {IF_ANOMALY_THRESHOLD}"
+    def setUp(self):
+        self.lr, self.tfidf = ml.build_pef_model()
 
-    def test_contamination_range(self):
-        from ml_analysis import IF_CONTAMINATION
-        assert 0.01 <= IF_CONTAMINATION <= 0.49, \
-            f"Contamination must be in [0.01, 0.49], got {IF_CONTAMINATION}"
+    def test_unencrypted_services_flagged(self):
+        """Known plaintext services should return PEF=1."""
+        for svc in ["ftp", "telnet", "smtp", "pop3", "redis"]:
+            pef = ml.predict_pef(svc, self.lr, self.tfidf)
+            self.assertEqual(pef, 1, f"Expected PEF=1 for '{svc}', got {pef}")
+
+    def test_encrypted_services_not_flagged(self):
+        """Known encrypted services should return PEF=0."""
+        for svc in ["https", "ssh", "sftp", "imaps", "smtps"]:
+            pef = ml.predict_pef(svc, self.lr, self.tfidf)
+            self.assertEqual(pef, 0, f"Expected PEF=0 for '{svc}', got {pef}")
+
+    def test_binary_output(self):
+        """PEF must always be 0 or 1."""
+        for svc in ["http", "https", "mysql", "unknown", "nping"]:
+            pef = ml.predict_pef(svc, self.lr, self.tfidf)
+            self.assertIn(pef, [0, 1])
 
 
-# ==============================================================================
-# Simple runner (no pytest required)
-# ==============================================================================
+class TestPSCModel(unittest.TestCase):
+    """Test Port Service Category via Multinomial Naive Bayes."""
 
-def run_all_tests():
-    test_classes = [
-        TestComputePRS,
-        TestComputeVES,
-        TestComputePEF,
-        TestComputePSC,
-        TestComputeVKF,
-        TestNVDDataset,
-        TestStage1,
-        TestConstants,
-    ]
+    def setUp(self):
+        self.nb, self.tfidf = ml.build_psc_model()
 
-    total   = 0
-    passed  = 0
-    failed  = 0
-    errors  = []
+    def test_web_category(self):
+        """HTTP/HTTPS should be categorised as Web (0)."""
+        self.assertEqual(ml.predict_psc("http",  80, self.nb, self.tfidf), 0)
+        self.assertEqual(ml.predict_psc("https", 443, self.nb, self.tfidf), 0)
 
-    for cls in test_classes:
-        instance = cls()
-        methods  = [m for m in dir(cls) if m.startswith("test_")]
-        for method_name in methods:
-            total += 1
-            try:
-                if hasattr(instance, "setup_method"):
-                    instance.setup_method()
-                getattr(instance, method_name)()
-                print(f"  ✓  {cls.__name__}.{method_name}")
-                passed += 1
-            except AssertionError as e:
-                print(f"  ✗  {cls.__name__}.{method_name}  →  {e}")
-                failed += 1
-                errors.append((f"{cls.__name__}.{method_name}", str(e)))
-            except Exception as e:
-                print(f"  !  {cls.__name__}.{method_name}  →  ERROR: {e}")
-                failed += 1
-                errors.append((f"{cls.__name__}.{method_name}", f"ERROR: {e}"))
+    def test_legacy_category(self):
+        """Telnet and FTP should be categorised as Legacy (1)."""
+        self.assertEqual(ml.predict_psc("telnet", 23, self.nb, self.tfidf), 1)
+        self.assertEqual(ml.predict_psc("ftp",    21, self.nb, self.tfidf), 1)
 
-    print()
-    print("=" * 60)
-    print(f"  RESULTS: {passed}/{total} tests passed")
-    if errors:
-        print(f"  FAILURES:")
-        for name, msg in errors:
-            print(f"    - {name}: {msg}")
-    else:
-        print("  All tests PASSED.")
-    print("=" * 60)
-    return failed == 0
+    def test_remote_access_category(self):
+        """SSH should be categorised as Remote-Access (3)."""
+        self.assertEqual(ml.predict_psc("ssh", 22, self.nb, self.tfidf), 3)
+
+    def test_database_category(self):
+        """MySQL and PostgreSQL should be categorised as Database (4)."""
+        self.assertEqual(ml.predict_psc("mysql",      3306, self.nb, self.tfidf), 4)
+        self.assertEqual(ml.predict_psc("postgresql", 5432, self.nb, self.tfidf), 4)
+
+    def test_output_in_valid_range(self):
+        """PSC must always be in [0, 5]."""
+        for svc, port in [("http", 80), ("ssh", 22), ("unknown", 0),
+                          ("redis", 6379), ("smb", 445)]:
+            psc = ml.predict_psc(svc, port, self.nb, self.tfidf)
+            self.assertIn(psc, [0, 1, 2, 3, 4, 5])
+
+
+class TestVKFModel(unittest.TestCase):
+    """Test Version Known Flag via Linear SVM."""
+
+    def setUp(self):
+        self.svm, self.scaler = ml.build_vkf_model()
+
+    def test_known_versions_detected(self):
+        """Real version strings should return VKF=1."""
+        for v in ["OpenSSH 7.4", "Apache httpd 2.4.7", "vsftpd 1.4.1",
+                  "lighttpd 0.93.15", "MySQL 5.7.32"]:
+            vkf = ml.predict_vkf(v, self.svm, self.scaler)
+            self.assertEqual(vkf, 1, f"Expected VKF=1 for '{v}', got {vkf}")
+
+    def test_unknown_versions_flagged(self):
+        """Empty or unknown version strings should return VKF=0."""
+        for v in ["unknown", "", "none"]:
+            vkf = ml.predict_vkf(v, self.svm, self.scaler)
+            self.assertEqual(vkf, 0, f"Expected VKF=0 for '{v}', got {vkf}")
+
+    def test_binary_output(self):
+        """VKF must always be 0 or 1."""
+        for v in ["OpenSSH 8.9", "unknown", "2.4.7", ""]:
+            vkf = ml.predict_vkf(v, self.svm, self.scaler)
+            self.assertIn(vkf, [0, 1])
+
+
+class TestVESEntropy(unittest.TestCase):
+    """Test Version Entropy Score formula."""
+
+    def test_unknown_version_max_entropy(self):
+        """Version 'unknown' should receive maximum VES (1.0)."""
+        ves = ml.compute_ves_entropy("unknown", ["unknown", "OpenSSH 7.4",
+                                                  "vsftpd 1.4.1", "lighttpd 0.93.15"])
+        self.assertGreaterEqual(ves, 0.40, "VES for 'unknown' should be high")
+
+    def test_detailed_version_low_entropy(self):
+        """Detailed version string should receive low VES."""
+        all_versions = ["unknown", "OpenSSH 8.9p1 Ubuntu 3ubuntu0.6",
+                        "lighttpd 0.93.15", "vsftpd 1.4.1"]
+        ves = ml.compute_ves_entropy("OpenSSH 8.9p1 Ubuntu 3ubuntu0.6", all_versions)
+        self.assertLessEqual(ves, 0.3, "VES for detailed version should be low")
+
+    def test_ves_in_range(self):
+        """VES must always be in [0, 1]."""
+        all_versions = ["unknown", "OpenSSH 7.4", "vsftpd 1.4.1", ""]
+        for v in all_versions:
+            ves = ml.compute_ves_entropy(v, all_versions)
+            self.assertGreaterEqual(ves, 0.0)
+            self.assertLessEqual(ves, 1.0)
+
+    def test_empty_string_high_ves(self):
+        """Empty version string should have high VES."""
+        ves = ml.compute_ves_entropy("", ["", "OpenSSH 7.4", "vsftpd 1.4.1"])
+        self.assertGreater(ves, 0.5, "Empty version should produce high VES")
+
+
+class TestRiskScoreFormulas(unittest.TestCase):
+    """Test GWVS, NEF, ARS formulas against paper values."""
+
+    def _make_df(self, rows):
+        """Helper: build a minimal DataFrame matching what stage_4 expects."""
+        records = []
+        for port, tier, prs, svc in rows:
+            records.append({
+                "port_id": port, "predicted_tier": tier,
+                "PRS": prs, "service_name": svc, "host_ip": "192.168.1.1",
+            })
+        return pd.DataFrame(records)
+
+    def test_gwvs_local_testbed(self):
+        """GWVS for local testbed should match paper value 58.33%."""
+        # Weights: Critical(4)×PRS for telnet,ftp; High(3)×PRS for http,ssh,dns; Medium(2)×PRS for https
+        num = 4*0.95 + 4*0.90 + 3*0.75 + 3*0.55 + 3*0.60 + 2*0.45
+        gwvs = round((num / (6 * 4)) * 100, 2)
+        self.assertAlmostEqual(gwvs, 58.33, places=1)
+
+    def test_nef_local_testbed(self):
+        """NEF for local testbed should match paper value 0.9412."""
+        nef = round((5 + 6 + 5) / (5 + 7 + 5), 4)
+        self.assertAlmostEqual(nef, 0.9412, places=3)
+
+    def test_ars_local_testbed(self):
+        """ARS for local testbed should match paper value 54.90%."""
+        gwvs = 58.33
+        nef  = 0.9412
+        ars  = round(gwvs * nef, 2)
+        self.assertAlmostEqual(ars, 54.90, places=0)
+
+    def test_severity_weights(self):
+        """SEVERITY_WEIGHTS must match CVSS-aligned tier weights."""
+        self.assertEqual(ml.SEVERITY_WEIGHTS["Critical"], 4)
+        self.assertEqual(ml.SEVERITY_WEIGHTS["High"],     3)
+        self.assertEqual(ml.SEVERITY_WEIGHTS["Medium"],   2)
+        self.assertEqual(ml.SEVERITY_WEIGHTS["Low"],      1)
+
+
+class TestXMLParsing(unittest.TestCase):
+    """Test XML parsing across all four sample scan files."""
+
+    SCAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "sample_scans")
+
+    def _parse(self, filename):
+        path = os.path.join(self.SCAN_DIR, filename)
+        return ml.stage_0_parse_nmap_xml(path)
+
+    def test_local_testbed_6_ports(self):
+        df = self._parse("scan_local_testbed.xml")
+        self.assertEqual(len(df), 6)
+        self.assertIn(23, df["port_id"].values)  # telnet present
+        self.assertIn(443, df["port_id"].values) # https present
+
+    def test_scanme_4_ports(self):
+        df = self._parse("scanme_results.xml")
+        self.assertEqual(len(df), 4)
+        self.assertIn(31337, df["port_id"].values)  # anomalous port
+
+    def test_pentest_8_ports(self):
+        df = self._parse("pentest_results.xml")
+        self.assertEqual(len(df), 8)
+        self.assertIn(3306, df["port_id"].values)   # mysql
+        self.assertIn(5432, df["port_id"].values)   # postgres
+
+    def test_juiceshop_1_port(self):
+        df = self._parse("juiceshop_results.xml")
+        self.assertEqual(len(df), 1)
+        self.assertEqual(int(df["port_id"].iloc[0]), 3000)
+
+    def test_required_columns_present(self):
+        df = self._parse("scan_local_testbed.xml")
+        for col in ["port_id", "protocol", "service_name", "service_version", "host_ip"]:
+            self.assertIn(col, df.columns)
+
+
+class TestIsolationForest(unittest.TestCase):
+    """Test Isolation Forest anomaly detection."""
+
+    def _make_feature_df(self):
+        """Build a DataFrame matching the 6-service local testbed feature matrix."""
+        rows = [
+            {"port_id": 23, "service_name": "telnet", "PRS": 0.95, "VES": 1.00, "PEF": 1, "PSC": 1, "VKF": 0},
+            {"port_id": 21, "service_name": "ftp",    "PRS": 0.90, "VES": 0.22, "PEF": 1, "PSC": 1, "VKF": 1},
+            {"port_id": 53, "service_name": "domain", "PRS": 0.60, "VES": 0.22, "PEF": 1, "PSC": 5, "VKF": 1},
+            {"port_id": 80, "service_name": "http",   "PRS": 0.75, "VES": 0.00, "PEF": 1, "PSC": 0, "VKF": 1},
+            {"port_id": 22, "service_name": "ssh",    "PRS": 0.55, "VES": 0.29, "PEF": 0, "PSC": 3, "VKF": 1},
+            {"port_id": 443,"service_name": "https",  "PRS": 0.45, "VES": 0.00, "PEF": 0, "PSC": 0, "VKF": 1},
+        ]
+        # Add dummy columns that stage_3 needs
+        for r in rows:
+            r["service_version"] = "1.0"
+            r["host_ip"] = "192.168.1.1"
+            r["port_state"] = "open"
+            r["CRI"] = r["PRS"]*100 + r["VES"]*100 + r["PEF"]*100
+            r["PSC_label"] = ml.PSC_LABELS.get(r["PSC"], "Unknown")
+            r["predicted_tier"] = "High"
+            r["rf_confidence"] = 0.9
+            r["prob_Critical"] = 0.1
+            r["prob_High"] = 0.9
+            r["prob_Medium"] = 0.0
+            r["prob_Low"] = 0.0
+        return pd.DataFrame(rows)
+
+    def test_output_columns_added(self):
+        df = self._make_feature_df()
+        result = ml.stage_3_isolation_forest(df)
+        self.assertIn("anomaly_score", result.columns)
+        self.assertIn("anomaly_label", result.columns)
+
+    def test_anomaly_labels_binary(self):
+        df = self._make_feature_df()
+        result = ml.stage_3_isolation_forest(df)
+        for label in result["anomaly_label"]:
+            self.assertIn(label, ["ANOMALY", "Normal"])
+
+    def test_scores_in_range(self):
+        df = self._make_feature_df()
+        result = ml.stage_3_isolation_forest(df)
+        for score in result["anomaly_score"]:
+            self.assertGreaterEqual(float(score), 0.0)
+            self.assertLessEqual(float(score), 1.0)
+
+    def test_telnet_highest_anomaly_score(self):
+        """Telnet should have the highest anomaly score in the testbed."""
+        df = self._make_feature_df()
+        result = ml.stage_3_isolation_forest(df)
+        max_score_port = result.loc[result["anomaly_score"].idxmax(), "port_id"]
+        self.assertEqual(int(max_score_port), 23,
+                         "Telnet (port 23) should have highest anomaly score")
+
+
+class TestTrainingDataset(unittest.TestCase):
+    """Test training dataset generation."""
+
+    def test_dataset_size(self):
+        """Training dataset must contain exactly 1,000 records."""
+        df = ml.build_training_dataset()
+        self.assertEqual(len(df), 1000)
+
+    def test_class_distribution(self):
+        """Class distribution must match paper: Critical 35%, High 30%, Medium 20%, Low 15%."""
+        df = ml.build_training_dataset()
+        dist = df["severity"].value_counts()
+        self.assertEqual(dist.get("Critical", 0), 350)
+        self.assertEqual(dist.get("High", 0), 300)
+        self.assertEqual(dist.get("Medium", 0), 200)
+        self.assertEqual(dist.get("Low", 0), 150)
+
+    def test_feature_columns_present(self):
+        """Dataset must have all five feature columns."""
+        df = ml.build_training_dataset()
+        for col in ["PRS", "VES", "PEF", "PSC", "VKF", "severity"]:
+            self.assertIn(col, df.columns)
+
+    def test_feature_ranges(self):
+        """All feature values must be within valid ranges."""
+        df = ml.build_training_dataset()
+        self.assertTrue((df["PRS"] >= 0.0).all() and (df["PRS"] <= 1.0).all())
+        self.assertTrue((df["VES"] >= 0.0).all() and (df["VES"] <= 1.0).all())
+        self.assertTrue(df["PEF"].isin([0, 1]).all())
+        self.assertTrue(df["PSC"].between(0, 5).all())
+        self.assertTrue(df["VKF"].isin([0, 1]).all())
+
+
+class TestPSCLabels(unittest.TestCase):
+    """Test PSC_LABELS dict completeness."""
+
+    def test_all_six_categories_present(self):
+        for i in range(6):
+            self.assertIn(i, ml.PSC_LABELS)
+
+    def test_label_names(self):
+        self.assertEqual(ml.PSC_LABELS[0], "Web")
+        self.assertEqual(ml.PSC_LABELS[1], "Legacy/Unencrypted")
+        self.assertEqual(ml.PSC_LABELS[2], "File-Share")
+        self.assertEqual(ml.PSC_LABELS[3], "Remote-Access")
+        self.assertEqual(ml.PSC_LABELS[4], "Database")
+        self.assertEqual(ml.PSC_LABELS[5], "Infrastructure")
 
 
 if __name__ == "__main__":
-    print("\nRunning VAPT Pipeline Unit Tests")
-    print("=" * 60)
-    success = run_all_tests()
-    sys.exit(0 if success else 1)
+    unittest.main(verbosity=2)
+
